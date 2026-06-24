@@ -61,6 +61,7 @@ size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
   while (input != end_input) {
     const __m512i v = _mm512_maskz_loadu_epi8(
         input_mask, reinterpret_cast<const __m512i *>(input));
+    SIMDUTF_MSAN_UNPOISON(&v, sizeof(v));
     const __m512i in = _mm512_permutexvar_epi8(shuffle_input, v);
     const __m512i indices = _mm512_multishift_epi64_epi8(multi_shifts, in);
     const __m512i result = _mm512_permutexvar_epi8(indices, lookup);
@@ -111,6 +112,7 @@ size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
   input_mask = ((__mmask64)1 << size) - 1;
   const __m512i v = _mm512_maskz_loadu_epi8(
       input_mask, reinterpret_cast<const __m512i *>(input));
+  SIMDUTF_MSAN_UNPOISON(&v, sizeof(v));
   const __m512i in = _mm512_permutexvar_epi8(shuffle_input, v);
   const __m512i indices = _mm512_multishift_epi64_epi8(multi_shifts, in);
   bool padding_needed =
@@ -271,6 +273,7 @@ static inline void load_block_partial(block64 *b, const char *src,
                                       __mmask64 input_mask) {
   b->chunks[0] = _mm512_maskz_loadu_epi8(
       input_mask, reinterpret_cast<const __m512i *>(src));
+  SIMDUTF_MSAN_UNPOISON(b, sizeof(*b));
 }
 
 // The caller of this function is responsible to ensure that there are 128 bytes
@@ -420,6 +423,7 @@ compress_decode_base64(char *dst, const chartype *src, size_t srclen,
     int idx = rem % 4;
     __mmask64 mask = ((__mmask64)1 << rem) - 1;
     __m512i input = _mm512_maskz_loadu_epi8(mask, buffer_start);
+    SIMDUTF_MSAN_UNPOISON(&input, sizeof(input));
     size_t output_len = (rem / 4) * 3;
     __mmask64 output_mask = mask >> (rem - output_len);
     const __m512i merge_ab_and_bc =
