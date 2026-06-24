@@ -1286,6 +1286,18 @@ simdutf_warn_unused size_t implementation::utf32_length_from_utf8(
 simdutf_warn_unused result implementation::base64_to_binary(
     const char *input, size_t length, char *output, base64_options options,
     last_chunk_handling_options last_chunk_options) const noexcept {
+  // Fast path for strict, standard (non-URL) base64 decoding of clean,
+  // canonically padded input - by far the most common case - skipping the option
+  // dispatch and the out-of-line compress_decode_base64 call below. On anything
+  // unusual it bails out and we fall through to the general dispatch.
+  if (options == base64_options::base64_default &&
+      last_chunk_options == last_chunk_handling_options::strict) {
+    size_t fast_count = 0;
+    if (try_fast_decode_base64<false, false>(output, input, length,
+                                             fast_count)) {
+      return {error_code::SUCCESS, fast_count};
+    }
+  }
   if (options & base64_default_or_url) {
     if (options == base64_options::base64_default_or_url_accept_garbage) {
       return compress_decode_base64<false, true, true>(

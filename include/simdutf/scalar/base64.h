@@ -97,7 +97,7 @@ struct reduced_input {
 // and the length of the input buffer with padding. The input buffer is not
 // modified. The function assumes that there are at most two padding characters.
 template <class char_type>
-simdutf_constexpr23 reduced_input find_end(const char_type *src, size_t srclen,
+simdutf_really_inline simdutf_constexpr23 reduced_input find_end(const char_type *src, size_t srclen,
                                            simdutf::base64_options options) {
   const uint8_t *to_base64 =
       (options & base64_default_or_url)
@@ -158,7 +158,7 @@ simdutf_constexpr23 reduced_input find_end(const char_type *src, size_t srclen,
 // if check_capacity is true, it will check that the destination buffer is
 // large enough. If it is not, it will return OUTPUT_BUFFER_TOO_SMALL.
 template <bool check_capacity, class char_type>
-simdutf_constexpr23 full_result base64_tail_decode_impl(
+simdutf_really_inline simdutf_constexpr23 full_result base64_tail_decode_impl(
     char *dst, size_t outlen, const char_type *src, size_t length,
     size_t padding_characters, // number of padding characters
                                // '=', typically 0, 1, 2.
@@ -365,7 +365,7 @@ simdutf_constexpr23 full_result base64_tail_decode_impl(
 }
 
 template <class char_type>
-simdutf_constexpr23 full_result base64_tail_decode(
+simdutf_really_inline simdutf_constexpr23 full_result base64_tail_decode(
     char *dst, const char_type *src, size_t length,
     size_t padding_characters, // number of padding characters
                                // '=', typically 0, 1, 2.
