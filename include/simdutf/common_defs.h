@@ -176,17 +176,4 @@
   #define simdutf_maybe_unused
 #endif
 
-// MemorySanitizer does not model masked AVX-512 loads (e.g.
-// _mm512_maskz_loadu_epi8): it reports false positives on the lanes the
-// hardware zero-fills. Mark such buffers initialized after the load.
-#if defined(__has_feature)
-  #if __has_feature(memory_sanitizer)
-    #include <sanitizer/msan_interface.h>
-    #define SIMDUTF_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
-  #endif
-#endif
-#ifndef SIMDUTF_MSAN_UNPOISON
-  #define SIMDUTF_MSAN_UNPOISON(ptr, size) ((void)(ptr), (void)(size))
-#endif
-
 #endif // SIMDUTF_COMMON_DEFS_H
