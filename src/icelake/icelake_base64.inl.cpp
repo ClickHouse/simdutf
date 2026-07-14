@@ -31,21 +31,6 @@ struct block64 {
   __m512i chunks[1];
 };
 
-// MemorySanitizer does not model the masked AVX-512 load (_mm512_maskz_loadu_epi8)
-// used for the partial tail block: it reports use-of-uninitialized-value on the
-// lanes the hardware zero-fills, even though the validity computation discards
-// them via the input mask. Unpoison the loaded vector to suppress the false
-// positive. No-op outside MemorySanitizer builds.
-#if defined(__has_feature)
-#  if __has_feature(memory_sanitizer)
-extern "C" void __msan_unpoison(const volatile void *, size_t);
-#    define SIMDUTF_ICELAKE_BASE64_UNPOISON(p, s) __msan_unpoison((p), (s))
-#  endif
-#endif
-#ifndef SIMDUTF_ICELAKE_BASE64_UNPOISON
-#  define SIMDUTF_ICELAKE_BASE64_UNPOISON(p, s) ((void)(p), (void)(s))
-#endif
-
 template <bool base64_url, bool use_lines>
 size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
                           base64_options options,
@@ -204,7 +189,6 @@ template <bool base64_url, bool ignore_garbage, bool default_or_url>
 static inline uint64_t to_base64_mask(block64 *b, uint64_t *error,
                                       uint64_t input_mask = UINT64_MAX) {
   __m512i input = b->chunks[0];
-  SIMDUTF_ICELAKE_BASE64_UNPOISON(&input, sizeof(input));
   const __m512i ascii_space_tbl = _mm512_set_epi8(
       0, 0, 13, 12, 0, 10, 9, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 13, 12, 0, 10,
       9, 0, 0, 0, 0, 0, 0, 0, 0, 32, 0, 0, 13, 12, 0, 10, 9, 0, 0, 0, 0, 0, 0,
