@@ -110,10 +110,69 @@ size_t write_output_with_line_feeds(uint8_t *dst, uint8x16_t src,
   }
 }
 
+// Scalar base64 encoding without line feeds. Encodes whole three-byte groups
+// with a single four-byte store - a base64 group is exactly four characters, so
+// this never overruns - and the final one or two bytes with the usual padding.
+// This matches tail_encode_base64_impl<false> exactly but avoids its four
+// separate byte stores per group, and is used both as the tail of the vectorized
+// encoder and, for small inputs, as the whole encoder (a single un-pipelined NEON
+// block is slower than this on aarch64).
+simdutf_really_inline size_t encode_base64_scalar(char *dst, const char *src,
+                                                  size_t srclen,
+                                                  base64_options options) {
+  const char *e0 = (options & base64_url) ? tables::base64::base64_url::e0
+                                          : tables::base64::base64_default::e0;
+  const char *e1 = (options & base64_url) ? tables::base64::base64_url::e1
+                                          : tables::base64::base64_default::e1;
+  const char *e2 = (options & base64_url) ? tables::base64::base64_url::e2
+                                          : tables::base64::base64_default::e2;
+  const bool use_padding =
+      ((options & base64_url) == 0) ^
+      ((options & base64_reverse_padding) == base64_reverse_padding);
+  const uint8_t *p = (const uint8_t *)src;
+  uint8_t *out = (uint8_t *)dst;
+  size_t remaining = srclen;
+  while (remaining >= 3) {
+    const uint8_t t1 = p[0], t2 = p[1], t3 = p[2];
+    const char group[4] = {e0[t1], e1[((t1 & 0x03) << 4) | ((t2 >> 4) & 0x0F)],
+                           e1[((t2 & 0x0F) << 2) | ((t3 >> 6) & 0x03)], e2[t3]};
+    std::memcpy(out, group, 4);
+    out += 4;
+    p += 3;
+    remaining -= 3;
+  }
+  if (remaining == 1) {
+    const uint8_t t1 = p[0];
+    *out++ = (uint8_t)e0[t1];
+    *out++ = (uint8_t)e1[(t1 & 0x03) << 4];
+    if (use_padding) {
+      *out++ = '=';
+      *out++ = '=';
+    }
+  } else if (remaining == 2) {
+    const uint8_t t1 = p[0], t2 = p[1];
+    *out++ = (uint8_t)e0[t1];
+    *out++ = (uint8_t)e1[((t1 & 0x03) << 4) | ((t2 >> 4) & 0x0F)];
+    *out++ = (uint8_t)e2[(t2 & 0x0F) << 2];
+    if (use_padding) {
+      *out++ = '=';
+    }
+  }
+  return size_t((char *)out - dst);
+}
+
 template <bool insert_line_feeds>
 size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
                           base64_options options,
                           size_t line_length = simdutf::default_line_length) {
+  // Inputs below the smallest NEON block are encoded scalar: there is no vector
+  // work to do, so we skip the vector table load and use the fast scalar encoder
+  // (four-byte stores) directly. Larger inputs use the vectorized path below.
+  if constexpr (!insert_line_feeds) {
+    if (srclen < 24) {
+      return encode_base64_scalar(dst, src, srclen, options);
+    }
+  }
   size_t offset = 0;
   if (line_length < 4) {
     line_length = 4; // We do not support line_length less than 4
@@ -136,6 +195,40 @@ size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
                                  : tables::base64::base64_default::e1));
 #endif
   size_t i = 0;
+  if constexpr (!insert_line_feeds) {
+    // Encode several 48-byte blocks per iteration so the independent loads,
+    // table lookups and stores can pipeline (the single-block loop below has a
+    // dependency through the loop counter between every block). This matches the
+    // unrolling of hand-written NEON base64 encoders and removes the multi-block
+    // encode regression on aarch64.
+    auto encode48 = [&](size_t pos) {
+      const uint8x16x3_t in = vld3q_u8((const uint8_t *)src + pos);
+      uint8x16x4_t result;
+      result.val[0] = vshrq_n_u8(in.val[0], 2);
+      result.val[1] =
+          vandq_u8(vsliq_n_u8(vshrq_n_u8(in.val[1], 4), in.val[0], 4), v3f);
+      result.val[2] =
+          vandq_u8(vsliq_n_u8(vshrq_n_u8(in.val[2], 6), in.val[1], 2), v3f);
+      result.val[3] = vandq_u8(in.val[2], v3f);
+      result.val[0] = vqtbl4q_u8(table, result.val[0]);
+      result.val[1] = vqtbl4q_u8(table, result.val[1]);
+      result.val[2] = vqtbl4q_u8(table, result.val[2]);
+      result.val[3] = vqtbl4q_u8(table, result.val[3]);
+      vst4q_u8(out, result);
+      out += 64;
+    };
+    for (; i + 4 * 48 <= srclen; i += 4 * 48) {
+      encode48(i);
+      encode48(i + 48);
+      encode48(i + 2 * 48);
+      encode48(i + 3 * 48);
+    }
+    if (i + 2 * 48 <= srclen) {
+      encode48(i);
+      encode48(i + 48);
+      i += 2 * 48;
+    }
+  }
   for (; i + 16 * 3 <= srclen; i += 16 * 3) {
     const uint8x16x3_t in = vld3q_u8((const uint8_t *)src + i);
     uint8x16x4_t result;
@@ -235,8 +328,12 @@ size_t encode_base64_impl(char *dst, const char *src, size_t srclen,
     }
     i += 24;
   }
-  out += scalar::base64::tail_encode_base64_impl<insert_line_feeds>(
-      (char *)out, src + i, srclen - i, options, line_length, offset);
+  if constexpr (!insert_line_feeds) {
+    out += encode_base64_scalar((char *)out, src + i, srclen - i, options);
+  } else {
+    out += scalar::base64::tail_encode_base64_impl<insert_line_feeds>(
+        (char *)out, src + i, srclen - i, options, line_length, offset);
+  }
   return size_t((char *)out - dst);
 }
 
@@ -593,6 +690,165 @@ static size_t compress_block_single(block64 *b, uint64_t mask, char *output) {
 
 template <typename T> bool is_power_of_two(T x) { return (x & (x - 1)) == 0; }
 
+// Fast path for decoding clean, strict, canonically padded standard base64 - the
+// dominant input shape for per-row decoding of a column. It validates and decodes
+// complete 64-character blocks with NEON, then decodes the remaining whole groups
+// and the final (optionally padded) group with a tight scalar loop, skipping the
+// per-call cost of find_end and the fully general base64_tail_decode. It returns
+// true and the number of decoded bytes in out_count on success, and false the
+// moment it meets anything that needs special handling - whitespace, an invalid
+// byte, misplaced or non-canonical padding, or a length that is not a positive
+// multiple of four - in which case the caller falls back to the general
+// implementation (nothing written to dst is relied upon, and src/srclen/dst are
+// left untouched).
+template <bool base64_url, bool default_or_url>
+simdutf_really_inline bool
+try_fast_decode_base64(char *dst, const char *src, size_t srclen,
+                       size_t &out_count) {
+  if (srclen < 4 || (srclen % 4) != 0) {
+    return false;
+  }
+  const uint8_t *const to_base64 =
+      default_or_url ? tables::base64::to_base64_default_or_url_value
+                     : (base64_url ? tables::base64::to_base64_url_value
+                                   : tables::base64::to_base64_value);
+  const uint32_t *const d0 =
+      default_or_url ? tables::base64::base64_default_or_url::d0
+                     : (base64_url ? tables::base64::base64_url::d0
+                                   : tables::base64::base64_default::d0);
+  const uint32_t *const d1 =
+      default_or_url ? tables::base64::base64_default_or_url::d1
+                     : (base64_url ? tables::base64::base64_url::d1
+                                   : tables::base64::base64_default::d1);
+  const uint32_t *const d2 =
+      default_or_url ? tables::base64::base64_default_or_url::d2
+                     : (base64_url ? tables::base64::base64_url::d2
+                                   : tables::base64::base64_default::d2);
+  const uint32_t *const d3 =
+      default_or_url ? tables::base64::base64_default_or_url::d3
+                     : (base64_url ? tables::base64::base64_url::d3
+                                   : tables::base64::base64_default::d3);
+
+  const unsigned char *in = reinterpret_cast<const unsigned char *>(src);
+  char *out = dst;
+
+  // Trailing padding: 0, 1 or 2 '=' characters (only valid at the very end).
+  unsigned padding = 0;
+  if (in[srclen - 1] == '=') {
+    padding = (in[srclen - 2] == '=') ? 2u : 1u;
+  }
+  const size_t nsig = srclen - padding; // number of significant characters
+  const unsigned char *const sig_end = in + nsig;
+
+  // Validate and decode complete 64-character blocks with NEON. The condition
+  // guarantees we never read into the (possibly padded) final group.
+  while (in + 64 <= sig_end) {
+    block64 b;
+    load_block(&b, reinterpret_cast<const char *>(in));
+    bool error = false;
+    const uint64_t mask = to_base64_mask<base64_url, default_or_url>(&b, &error);
+    if (mask != 0) {
+      return false; // whitespace, invalid byte or padding inside the block
+    }
+    char decoded_values[64];
+    copy_block(&b, decoded_values);
+    base64_decode_block(out, decoded_values);
+    out += 48;
+    in += 64;
+  }
+
+  // Remaining whole groups (every group but a possible final padded one). For
+  // valid input the three output bytes occupy the low 24 bits, so a single
+  // four-byte store (whose extra zero byte is overwritten by the next group or
+  // the final group) is faster than three byte stores. The very last store is
+  // made exact so we never write past the end of the output.
+  const unsigned char *const group_end =
+      sig_end - (padding != 0 ? (4 - padding) : 0);
+#if !SIMDUTF_IS_BIG_ENDIAN
+  // Decode four groups (sixteen characters) per iteration with a single validity
+  // check: any invalid, whitespace or padding character sets bit 24 in its table
+  // entry, so it shows up in the combined value. The loop condition keeps at least
+  // one more group after the batch, so the four-byte store of the last group never
+  // writes past the output.
+  while (in + 16 < group_end) {
+    const uint32_t x0 = d0[in[0]] | d1[in[1]] | d2[in[2]] | d3[in[3]];
+    const uint32_t x1 = d0[in[4]] | d1[in[5]] | d2[in[6]] | d3[in[7]];
+    const uint32_t x2 = d0[in[8]] | d1[in[9]] | d2[in[10]] | d3[in[11]];
+    const uint32_t x3 = d0[in[12]] | d1[in[13]] | d2[in[14]] | d3[in[15]];
+    if (((x0 | x1 | x2 | x3) >> 24) != 0) {
+      return false;
+    }
+    std::memcpy(out + 0, &x0, 4);
+    std::memcpy(out + 3, &x1, 4);
+    std::memcpy(out + 6, &x2, 4);
+    std::memcpy(out + 9, &x3, 4);
+    out += 12;
+    in += 16;
+  }
+  while (in + 4 < group_end) {
+    const uint32_t x = d0[in[0]] | d1[in[1]] | d2[in[2]] | d3[in[3]];
+    if (x >= 0x01FFFFFFU) {
+      return false; // whitespace, invalid byte or misplaced padding
+    }
+    std::memcpy(out, &x, 4);
+    out += 3;
+    in += 4;
+  }
+  if (in < group_end) {
+    const uint32_t x = d0[in[0]] | d1[in[1]] | d2[in[2]] | d3[in[3]];
+    if (x >= 0x01FFFFFFU) {
+      return false;
+    }
+    if (padding != 0) {
+      std::memcpy(out, &x, 4); // a final padded group follows, so this is safe
+    } else {
+      out[0] = static_cast<char>(x);
+      out[1] = static_cast<char>(x >> 8);
+      out[2] = static_cast<char>(x >> 16);
+    }
+    out += 3;
+    in += 4;
+  }
+#else
+  while (in < group_end) {
+    const uint32_t x = d0[in[0]] | d1[in[1]] | d2[in[2]] | d3[in[3]];
+    if (x >= 0x01FFFFFFU) {
+      return false; // whitespace, invalid byte or misplaced padding
+    }
+    out[0] = static_cast<char>(x);
+    out[1] = static_cast<char>(x >> 8);
+    out[2] = static_cast<char>(x >> 16);
+    out += 3;
+    in += 4;
+  }
+#endif
+
+  // Final group. Strict mode requires canonical padding, so the discarded low
+  // bits of the last significant character must be zero.
+  if (padding == 1) {
+    const uint32_t c0 = to_base64[in[0]];
+    const uint32_t c1 = to_base64[in[1]];
+    const uint32_t c2 = to_base64[in[2]];
+    if (c0 > 63 || c1 > 63 || c2 > 63 || (c2 & 0x03) != 0) {
+      return false;
+    }
+    out[0] = static_cast<char>((c0 << 2) | (c1 >> 4));
+    out[1] = static_cast<char>((c1 << 4) | (c2 >> 2));
+    out += 2;
+  } else if (padding == 2) {
+    const uint32_t c0 = to_base64[in[0]];
+    const uint32_t c1 = to_base64[in[1]];
+    if (c0 > 63 || c1 > 63 || (c1 & 0x0F) != 0) {
+      return false;
+    }
+    out[0] = static_cast<char>((c0 << 2) | (c1 >> 4));
+    out += 1;
+  }
+
+  out_count = size_t(out - dst);
+  return true;
+}
+
 template <bool base64_url, bool ignore_garbage, bool default_or_url,
           typename char_type>
 full_result
@@ -603,6 +859,19 @@ compress_decode_base64(char *dst, const char_type *src, size_t srclen,
       default_or_url ? tables::base64::to_base64_default_or_url_value
                      : (base64_url ? tables::base64::to_base64_url_value
                                    : tables::base64::to_base64_value);
+  // Fast path for the overwhelmingly common case of decoding clean, strict,
+  // canonically padded standard base64 (see try_fast_decode_base64). On anything
+  // unusual it bails out and we fall through to the fully general implementation
+  // below, leaving src/srclen/dst untouched.
+  if constexpr (!ignore_garbage && sizeof(char_type) == 1) {
+    if (last_chunk_options == last_chunk_handling_options::strict) {
+      size_t fast_count = 0;
+      if (try_fast_decode_base64<base64_url, default_or_url>(
+              dst, reinterpret_cast<const char *>(src), srclen, fast_count)) {
+        return {error_code::SUCCESS, srclen, fast_count};
+      }
+    }
+  }
   auto ri = simdutf::scalar::base64::find_end(src, srclen, options);
   size_t equallocation = ri.equallocation;
   size_t equalsigns = ri.equalsigns;

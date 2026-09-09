@@ -307,6 +307,14 @@ static inline uint32_t detect_supported_architectures() {
 static inline uint32_t detect_supported_architectures() {
   uint32_t host_isa = instruction_set::DEFAULT;
   #if defined(__linux__)
+  // Older Linux kernel headers (e.g. in cross-compilation sysroots) may not
+  // define the LoongArch HWCAP bits yet. Provide the stable kernel ABI values.
+  #ifndef HWCAP_LOONGARCH_LSX
+    #define HWCAP_LOONGARCH_LSX (1 << 4)
+  #endif
+  #ifndef HWCAP_LOONGARCH_LASX
+    #define HWCAP_LOONGARCH_LASX (1 << 5)
+  #endif
   uint64_t hwcap = 0;
   hwcap = getauxval(AT_HWCAP);
   if (hwcap & HWCAP_LOONGARCH_LSX) {

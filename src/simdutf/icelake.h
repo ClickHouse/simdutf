@@ -30,6 +30,25 @@
       "You are using a legacy GCC compiler, we are disabling AVX-512 support"
 #endif
 
+// MemorySanitizer in LLVM 21 miscompiles the shadow check for AVX-512
+// permutation intrinsics (vpermi2var/vpermilvar): maskedCheckAVXIndexShadow
+// checks the concrete index value instead of its shadow, so any
+// _mm512_permutex2var_epi8 with a non-constant index (e.g. to_base64_mask in
+// icelake_base64.inl.cpp) reports a false use-of-uninitialized-value even for
+// fully initialized input. Introduced by
+// https://github.com/llvm/llvm-project/pull/147839 and fixed by
+// https://github.com/llvm/llvm-project/pull/148785 (first released in
+// LLVM 22, not backported to 21.x). Disable the icelake implementation when
+// compiling with MemorySanitizer under Clang 21 or older so the runtime
+// dispatcher falls back to haswell.
+#if defined(__has_feature) && defined(__clang__) && __clang_major__ < 22
+  #if __has_feature(memory_sanitizer)
+    #ifndef SIMDUTF_IMPLEMENTATION_ICELAKE
+      #define SIMDUTF_IMPLEMENTATION_ICELAKE 0
+    #endif
+  #endif
+#endif
+
 // We allow icelake on x64 as long as the compiler is known to support VBMI2.
 #ifndef SIMDUTF_IMPLEMENTATION_ICELAKE
   #define SIMDUTF_IMPLEMENTATION_ICELAKE                                       \
